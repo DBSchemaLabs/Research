@@ -8,6 +8,10 @@ Postgres on its own can keep the old shape over new storage, but the translation
 
 ### The plan
 
-1. **Read the literature.** Get a map of the main approaches to changing a schema while it's in use. Also work out why industry mostly hasn't picked them up. If the papers solved this years ago, why am I still writing expand/contract by hand?
-2. **Rebuild each paper's core idea.** For each one (PRISM, InVerDa, QuantumDB, F1, BullFrog, Tesseract, KVolve and the Lawrence & Adachi study) I'll rebuild the main mechanism in my sandbox and then try to break it. My versions will be simplified imitations, not the authors' code. One note per paper.
-3. **Check what's actually runnable.** Which of these have code I can build and run today, and which only exist as a PDF and a nice diagram?
+Rebuilding every paper in my sandbox would be a lot of work and a lot of bugs, most of them mine. So first I'll just read, and keep track of what I don't understand or what the paper doesn't cover.
+
+1. **Read the papers, one at a time.** PRISM, InVerDa, QuantumDB, F1, BullFrog, Tesseract, KVolve, and the Lawrence & Adachi study. Notes go section by section, skipping the history and related-work parts, then a summary of what the paper claims, then my doubts about what it doesn't cover. One commit per paper.
+2. **Answer my own doubts.** Once all of them are read, go back and answer each doubt as best I can. Some will be answered by a later paper, and some will turn out to be obvious.
+3. **Compile what's left.** Everything still unanswered goes into one list of gaps. That list decides Phase 3: which ones need an experiment, and which I can just decide.
+
+Note template: [TEMPLATE.md](TEMPLATE.md)
