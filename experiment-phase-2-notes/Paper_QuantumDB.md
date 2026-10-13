@@ -56,3 +56,38 @@ de Jong, van Deursen, Cleve · [PDF](https://pure.tudelft.nl/ws/files/11926973/T
 
 * Implementation: QuantumDB, open source, written in Java, targets PostgreSQL. It supports 11 schema operations and has over 300 tests.
 
+## Section 6 - Evaluation
+* All 19 scenarios from Section 4 were re-run through QuantumDB, on PostgreSQL 9.4 only. "QuantumDB is nonblocking for all scenarios." Their figure for the first scenario shows no visible change in query latency before and after the DDL.
+* Real history from Magnet.me: 95 changesets with 532 schema operations over 46 weeks, about two schema changes a week. The oldest backup had 77 tables and 3.8 million rows.
+* 35 of the 95 changesets used DDL that blocks, about a third.
+* QuantumDB could run 61 of the 95 as they were. 24 more worked only partly, because they also needed hand-written DML (data changes), and 10 couldn't be used at all. Views and custom functions aren't supported.
+* Replaying the 85 usable changesets took 2 h 25 min in total, about 1.7 minutes each, with no load on the database.
+* There are no numbers for query latency, throughput or storage overhead. The triggers "add a small overhead".
+
+
+## Section 7 - Discussion
+* Liquibase ran all 95 changesets in about 8 minutes, but 35 of them would have blocked. QuantumDB is slower, and doesn't block.
+* Tested under simulated load with their own tool, Nemesis. Not yet used in production at Magnet.me.
+* Only two schemas can be active at once. That covers a rolling upgrade, but not canary releases with several versions live.
+* Scaling is expected to be linear (double the data, double the time to reach the mixed state), but that wasn't measured. "The busier the database system the slower the copying process becomes."
+* Trigger overhead on write-heavy workloads still needs research.
+* No data is lost if something fails, because the original tables are never modified.
+* Limits: PostgreSQL and JVM languages only, and no DML inside changesets.
+* Foreign key chains: at Magnet.me, changing the `users` table needs ghost copies of "the majority of tables in the database".
+* Everything comes from one company, which "may not be representative".
+
+
+## My 2 cents
+
+QuantumDB is the first one that feels like it was written by someone who has deployed software. It starts from the mixed state, measures blocking before designing anything, keeps foreign keys, and knows when the old version can go. Leaving the original tables untouched is a lovely property: rollback is just "drop the new stuff".
+
+But underneath, it's my E3 again, done twice. Copies of tables, triggers in both directions, a batched backfill. And it pays for that in the places Phase 1 already flagged: storage (a whole foreign key neighbourhood copied), write cost (two triggers per write), and, for our case, the value mapping it can't really express.
+
+Some things I keep coming back to:
+
+* The layer in the driver is the most interesting part. QuantumDB already sits between the app and the database, and already knows which version each connection is on. Right now it only swaps table names. If that layer also knew the mapping, it could rewrite `status = 'paid'` to `status_id = 2`, aim writes at the right column, and handle upserts against a real table.
+* Copying tables shouldn't be the default. Our change is one column. Adding `status_id` next to `status` in the same table, and filling it in, touches far less than copying `orders` and everything that references it.
+* The version should be a stage, not just a connection setting. Each connection picks a version once, in its URL. During a migration the right SQL changes as the migration moves along, so the layer should learn the current stage from the database, rather than be told once at connect time.
+* Knowing who's connected is the right idea for coordination. It needs to cope with pools that never reconnect, though, so the stage change should reach existing connections, not only new ones.
+* Some writers will always skip the driver. A cron job or a psql session won't use the wrapper, so something in the database still has to keep both sides in agreement. QuantumDB's triggers do that, but they're on all the time, not only while the migration needs them.
+* Data changes are part of the schema change. A value mapping is the whole point of our change, so it can't be the part that's left for the developer to do by hand.

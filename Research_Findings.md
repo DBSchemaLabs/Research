@@ -1,6 +1,6 @@
 # Research Findings
 
-Last updated after reading InVerDa.
+Last updated after reading QuantumDB.
 
 ## The problem
 
@@ -54,17 +54,37 @@ What it lacks
 * It has no plan for the deployment. Apps still have to pick a version, and someone has to track which app is on which one before the old version can be dropped.
 * It was tested on PostgreSQL 9.4 with a single thread and 100,000 rows, so there's nothing on concurrency or tail latency.
 
+### QuantumDB (ICSE SEIP 2017) · [notes](experiment-phase-2-notes/Paper_QuantumDB.md)
+
+QuantumDB starts from the in-between period, where old and new versions of the app run at the same time during a rolling deploy. It makes a "ghost" copy of every table the change touches, keeps the copies in sync with triggers in both directions, and backfills existing rows in small batches. A wrapper around the JDBC driver points each connection at its version's tables, and the old version is dropped once no connection uses it.
+
+What it solves
+* Old and new apps run side by side, each seeing its own schema, which is what a rolling deploy needs.
+* None of the 19 measured schema changes blocked queries through QuantumDB, on PostgreSQL 9.4.
+* Foreign keys hold the whole time, unlike InVerDa.
+* The original tables are never modified, so a failed change rolls back cleanly with no data loss.
+* It tracks which connections use which version, so it knows when the old version can go.
+* About two thirds of a real company's changesets (61 of 95) ran through it as they were.
+
+What it lacks
+* It's E3 done twice. A write fires a trigger on one side and then the other, and there are no numbers on what that costs.
+* It copies a lot. Every table that points to the changed one gets a ghost copy too, and at Magnet.me that meant most of the database for a change to `users`.
+* It can't express our value mapping cleanly. The wrapper only rewrites table names, and data changes (DML) inside a changeset aren't supported, so the `'paid'` ↔ 2 mapping would be written by hand.
+* The version is fixed per connection, in a JDBC URL. That's a config change, Java-only, and long-lived connection pools could keep an old version alive.
+* Only two schemas can be live at once.
+* It was evaluated on PostgreSQL 9.4, the replay ran with no load, it hadn't been used in production yet, and everything came from one company.
+
 ## Side by side
 
-| | Phase 1 view (E3) | PRISM | InVerDa |
-|---|---|---|---|
-| Old app reads | Yes | Yes | Yes |
-| Old app writes | Yes (trigger) | No | Yes |
-| Old and new apps live together | Partly | Old app reads only | Yes |
-| Text → int value mapping | Yes (lookup table) | One way only | One way only (drop uses a default) |
-| Keeps the index on selective reads | No | Unclear (depends on the rewrite) | No, for non-materialized versions |
-| Upserts / constraints | No | Unclear | No (constraints out of scope) |
-| Behaviour during migration | Measured, brief lock with queueing risk | Not discussed | "Available", not measured |
-| Storage | 2× after backfill | Old DB copy until deploy | Stored once + auxiliary tables |
-| Prepared statements / drivers | Measured (E4, E7) | Not discussed | Not discussed |
-| Tested on | PostgreSQL 16, 2M rows, live writes | MySQL 5.0 / DB2, offline | PostgreSQL 9.4, single thread |
+| | Phase 1 view (E3) | PRISM | InVerDa | QuantumDB |
+|---|---|---|---|---|
+| Old app reads | Yes | Yes | Yes | Yes |
+| Old app writes | Yes (trigger) | No | Yes | Yes |
+| Old and new apps live together | Partly | Old app reads only | Yes | Yes, two at most |
+| Text → int value mapping | Yes (lookup table) | One way only | One way only (drop uses a default) | Hand-written (no DML in changesets) |
+| Keeps the index on selective reads | No | Unclear (depends on the rewrite) | No, for non-materialized versions | Likely, each version reads a real table (not tested in the paper) |
+| Upserts / constraints | No | Unclear | No (constraints out of scope) | Foreign keys kept; upserts not discussed |
+| Behaviour during migration | Measured, brief lock with queueing risk | Not discussed | "Available", not measured | Non-blocking in 19 tests; lock queues not tested |
+| Storage | 2× after backfill | Old DB copy until deploy | Stored once + auxiliary tables | Ghost copies of the table and everything referencing it |
+| Prepared statements / drivers | Measured (E4, E7) | Not discussed | Not discussed | JDBC wrapper only; prepared statements not discussed |
+| Tested on | PostgreSQL 16, 2M rows, live writes | MySQL 5.0 / DB2, offline | PostgreSQL 9.4, single thread | PostgreSQL 9.4, simulated load, one company |
