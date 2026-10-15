@@ -1,6 +1,6 @@
 # Research Findings
 
-Last updated after reading QuantumDB.
+Last updated after reading F1.
 
 ## The problem
 
@@ -74,17 +74,36 @@ What it lacks
 * Only two schemas can be live at once.
 * It was evaluated on PostgreSQL 9.4, the replay ran with no load, it hadn't been used in production yet, and everything came from one company.
 
+### F1 (VLDB 2013) · [notes](experiment-phase-2-notes/Paper_F1.md)
+
+F1 is Google's distributed database, where there's no moment when every server switches schema together. So each change walks through two hidden in-between states, delete-only and write-only, in an order that's proven never to corrupt data while servers disagree. Leases on the schema and write fencing guarantee that no more than two schema versions are ever in use.
+
+What it solves
+* No global switch-over and no downtime, across about 1,500 servers in five datacenters.
+* A proven-safe order for every change: add, write-only, backfill, then public, and the reverse for drops. It's the order I used in E3, with names and a proof.
+* Coordination is guaranteed rather than hoped for. After one lease period, every server is on the new schema or can't write.
+* Long-running writes don't hold everyone up. A write that outlives its lease is fenced off and retried, which is the opposite of E9's lock queue.
+* Real production numbers with tail latency. Reads barely changed (p99 +4.5%), writes got slower (p50 +67%).
+
+What it lacks
+* It doesn't help the app at all. There's no query rewriting, and the paper says so.
+* It only adds and removes things. There's no type change, rename, or value mapping, so `'paid'` = 2 is outside the model.
+* It assumes every writer is an F1 server running the protocol. A cron job or psql session isn't covered.
+* It's slow. A change with no backfill takes 10 to 20 minutes of waiting for leases.
+* There are no numbers on how many writes were fenced off and retried.
+* It's built on Spanner. Write fencing needs the storage layer to refuse late writes, which PostgreSQL doesn't do on its own.
+
 ## Side by side
 
-| | Phase 1 view (E3) | PRISM | InVerDa | QuantumDB |
-|---|---|---|---|---|
-| Old app reads | Yes | Yes | Yes | Yes |
-| Old app writes | Yes (trigger) | No | Yes | Yes |
-| Old and new apps live together | Partly | Old app reads only | Yes | Yes, two at most |
-| Text → int value mapping | Yes (lookup table) | One way only | One way only (drop uses a default) | Hand-written (no DML in changesets) |
-| Keeps the index on selective reads | No | Unclear (depends on the rewrite) | No, for non-materialized versions | Likely, each version reads a real table (not tested in the paper) |
-| Upserts / constraints | No | Unclear | No (constraints out of scope) | Foreign keys kept; upserts not discussed |
-| Behaviour during migration | Measured, brief lock with queueing risk | Not discussed | "Available", not measured | Non-blocking in 19 tests; lock queues not tested |
-| Storage | 2× after backfill | Old DB copy until deploy | Stored once + auxiliary tables | Ghost copies of the table and everything referencing it |
-| Prepared statements / drivers | Measured (E4, E7) | Not discussed | Not discussed | JDBC wrapper only; prepared statements not discussed |
-| Tested on | PostgreSQL 16, 2M rows, live writes | MySQL 5.0 / DB2, offline | PostgreSQL 9.4, single thread | PostgreSQL 9.4, simulated load, one company |
+| | Phase 1 view (E3) | PRISM | InVerDa | QuantumDB | F1 |
+|---|---|---|---|---|---|
+| Old app reads | Yes | Yes | Yes | Yes | Not addressed (no query rewriting) |
+| Old app writes | Yes (trigger) | No | Yes | Yes | Not addressed |
+| Old and new apps live together | Partly | Old app reads only | Yes | Yes, two at most | Database servers yes, two versions at most; apps not addressed |
+| Text → int value mapping | Yes (lookup table) | One way only | One way only (drop uses a default) | Hand-written (no DML in changesets) | Not in the model (add and drop only) |
+| Keeps the index on selective reads | No | Unclear (depends on the rewrite) | No, for non-materialized versions | Likely, each version reads a real table (not tested in the paper) | Yes, no views involved |
+| Upserts / constraints | No | Unclear | No (constraints out of scope) | Foreign keys kept; upserts not discussed | Foreign key and unique constraints go through a write-only state |
+| Behaviour during migration | Measured, brief lock with queueing risk | Not discussed | "Available", not measured | Non-blocking in 19 tests; lock queues not tested | Measured in production: reads p99 +4.5%, writes p50 +67%; late writes fenced |
+| Storage | 2× after backfill | Old DB copy until deploy | Stored once + auxiliary tables | Ghost copies of the table and everything referencing it | Both columns during the change; leftovers garbage-collected |
+| Prepared statements / drivers | Measured (E4, E7) | Not discussed | Not discussed | JDBC wrapper only; prepared statements not discussed | Not discussed |
+| Tested on | PostgreSQL 16, 2M rows, live writes | MySQL 5.0 / DB2, offline | PostgreSQL 9.4, single thread | PostgreSQL 9.4, simulated load, one company | Google production, ~1,500 servers, 19 changes |

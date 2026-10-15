@@ -47,4 +47,50 @@ This section is closer to what I deal with day to day than the rest of the paper
 
 > Question - If the old app keeps writing only `status` while `status_id` is write-only, every one of its writes needs translating. F1 assumes every writer is an F1 server running the protocol. What about writers that aren't, like a cron job or a psql session?
 
+## Section 4 - Implementation
+* Only one Spanner feature is needed for correctness: write fencing. A write can be given a deadline, and it can't commit once the schema it was written under has expired.
 
+> Question - Why not just let a stalled write commit under the older schema? Because each step is only safe between neighbouring versions. A write from one version behind is fine; that's what the states are for. A write from two versions behind (a server that paused before the index was write-only, and woke after it went public) leaves a row with no index entry, which queries then silently miss. Fencing turns that into a retry. In our case it would be a client that wrote only `status` waking up after reads moved to `status_id`.
+
+* The schema is a file in version control. Changes are applied about twice a week. A tool works out which in-between schemas and backfills a change needs, then applies them in order.
+* Schema leases:
+  * Every F1 server holds a lease on the schema, typically a few minutes long, and renews it by re-reading the schema from one well-known place.
+  * A server that can't renew shuts itself down, and the cluster manager restarts it.
+  * A new schema is written at most once per lease period. So by the time the next one comes, every server is either on the latest schema or can't commit at all. That's what keeps it to two versions.
+* That waiting adds up. "A typical schema change involving no reorganization takes 10 to 20 minutes."
+* Backfill runs as a background MapReduce job. It scans the rows as of when the change started, can be stopped and resumed, and is safe to run twice. Rows a user has already changed since then are skipped.
+* Each server keeps a few schema versions in memory. New writes use the newest. A write still running on the old version can finish, unless its lease runs out, in which case it's cut off and has to be resubmitted.
+
+## Section 5 - Impact on User Transactions
+* Production numbers: about 1,500 F1 servers in five datacenters, 19 schema changes over about 10 weeks. Over a billion operations with no schema change running, and over 50 million during one. Roughly 75% reads, 25% writes.
+* Latency, in milliseconds, without and during a schema change:
+
+  | | Reads, normal | Reads, during | Writes, normal | Writes, during |
+  |---|---:|---:|---:|---:|
+  | p50 | 2.84 | 2.94 (+3.5%) | 107.16 | 179.26 (+67.3%) |
+  | p90 | 79.82 | 74.23 (−7.0%) | 497.27 | 616.08 (+23.9%) |
+  | p99 | 170.33 | 178.05 (+4.5%) | 965.69 | 1076.69 (+11.5%) |
+
+* Fenced-off writes are resubmitted, which "causes wasted work", but there's no number for how often that happens.
+
+
+## Summary of claims / benefits
+* Schema changes can run with no global switch-over moment, and no downtime, across a large distributed database.
+* Every change goes through delete-only and write-only states in a proven-safe order, so mixed versions never corrupt data.
+* Leases and write fencing guarantee no more than two schema versions are ever in use.
+* Backfill runs in the background, resumable and safe to repeat.
+* Production impact is small for reads and moderate for writes, measured over 19 real changes on about 1,500 servers.
+
+## My 2 cents
+
+F1 is the most convincing paper so far, because it's the only one that's clearly been through production. It doesn't try to keep old queries working. It makes sure that while servers disagree about the schema, nothing gets corrupted, and it proves it.
+
+What it doesn't do is exactly my problem. It covers the database's own servers being on different versions. It doesn't cover the app: there's no query rewriting, no value mapping, and no help for an old client that still writes `status`. So it's a very good answer to half the question.
+
+Some things I keep coming back to:
+
+* The states are the right shape for a migration. Add, write-only, backfill, switch reads, contract. That's what I did in E3 by instinct. Having names for them, and knowing which moves are safe, should apply to the app as well as the database.
+* Leases and fencing are the missing coordination piece. Every other paper either ignored "who's on which version" or tracked it loosely. If app clients held a lease on the migration stage, and the database refused writes from clients on an expired stage, a stale client couldn't corrupt anything, even if it paused for a minute.
+* The fence has to be in the database. A lease the client checks by itself isn't enough: a client that stalls can wake up and write after its lease has run out. F1 relies on Spanner to refuse the write.
+* Slow but safe is a fair trade. 10 to 20 minutes for a change that nobody notices is better than 36 ms that makes everyone queue (E9).
+* The value mapping still has nowhere to live. F1 knows how to add `status_id` and drop `status` safely, but not that one is the other in a different encoding. Something has to own that mapping and apply it during the write-only stage, for every writer.
