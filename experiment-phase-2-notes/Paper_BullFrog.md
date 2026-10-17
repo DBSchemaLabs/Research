@@ -54,3 +54,51 @@ Bhattacherjee, Liao, Hicks, Abadi · [PDF](https://par.nsf.gov/servlets/purl/102
 * After the switch:
   * For a change that isn't backward compatible, "the old schema becomes inactive, and all subsequent requests that access it are rejected." Every app instance has to switch at the same moment, which they call a "big flip".
   * For backward-compatible changes, old app versions can keep running while they're updated gradually.
+
+## Section 4 - Experimental Evaluation
+
+Results by migration type
+
+| Migration | Size | Eager | BullFrog at 450 TPS | BullFrog at 700 TPS |
+|---|---|---|---|---|
+| Split a table (1 old row → several) | 1.5M rows | ~80 s with no new-schema transactions | Throughput unaffected | Latency rose, then throughput dropped as work queued |
+| Aggregate (several → 1) | 15M rows into a small table | Similar to the split, shorter disruption | Unaffected | Fell behind |
+| Join two tables (n:n) | ~8M rows | Over 200 s of downtime | No throughput dip | ~10 s per transaction, ~100 TPS lower |
+
+On the table split, BullFrog also:
+* completed 13% more transactions than eager over the test;
+* had latency up to an order of magnitude better than eager and multi-step, and close to running with no migration;
+* needed its background threads (started 20 s in) to finish at all. Without them, the migration didn't complete within the test.
+
+Multi-step took longer than BullFrog, and its throughput kept falling, because every update had to go to both schemas.
+
+Tracking overhead
+
+| What they varied | What happened |
+|---|---|
+| Bitmap / hash table on or off | Very little difference. The structures themselves are cheap |
+| Hot set: 1.5M rows → 15,000 | Throughput dropped for longer, because requests waited on each other's lock bits |
+| Track single rows vs whole pages | Pages made each request slower but finished the migration sooner. Rows win at low contention, pages at high |
+| Foreign keys on or off | Checking them meant migrating more data, so throughput dropped earlier on workloads that hit the affected table |
+
+## Summary of claims / benefits
+* The new schema is usable the moment the DDL runs. No backfill has to finish first.
+* Rows move only when they're needed, plus background threads for the rest, each row exactly once, even under concurrent access.
+* The mapping is plain SQL, so it can be a join to a lookup table.
+* At moderate load, throughput and latency were close to running with no migration at all, with up to an order of magnitude better latency than eager or multi-step.
+* No core Postgres changes: it's an extension.
+
+## My 2 cents
+
+BullFrog flips the question. Instead of "how do we keep both schemas alive", it asks "why move anything before someone needs it". The switch is instant, the mapping is just SQL, and at normal load nobody notices. For the part of a migration that's really just backfill, that's a very good idea.
+
+But it gets there by cutting off the old app. Ours isn't a backward-compatible change, so with BullFrog every old instance starts failing the moment the DDL runs. That's the big flip QuantumDB and F1 were designed to avoid. It also turns reads into writes, and keeps track of what's moved only in memory.
+
+Some things I keep coming back to:
+
+* Lazy is a backfill strategy, not a whole migration. Moving rows on demand, with background threads for the rest, would work just as well as one stage inside a longer migration. The cutover and the backfill don't have to be the same moment.
+* A read shouldn't have to become a write. If the mapping is known, a read of a row that hasn't moved can be answered by translating it on the fly (`'paid'` becomes 2 in the query result), with the actual move left to the background. Then read-only transactions and replicas keep working.
+* The old app shouldn't be rejected. If whatever sits in front of the database knows both the old shape and the mapping, the old app's queries can be translated onto the new table instead of refused. Then there's no big flip, and pods can roll over at their own pace.
+* Where the migration is up to has to survive a crash. A bitmap in memory with no recovery isn't good enough. The progress belongs somewhere durable, in the database itself.
+* Background work needs a brake. At 700 TPS the migration pushed the system over the edge. The background threads should slow down when the database is busy, not compete with it.
+* Mapping as plain SQL, including a lookup table, is the right way to write it. Much easier than PRISM's functions or InVerDa's add-and-drop.

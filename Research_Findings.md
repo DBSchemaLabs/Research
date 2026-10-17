@@ -1,6 +1,6 @@
 # Research Findings
 
-Last updated after reading F1.
+Last updated after reading BullFrog.
 
 ## The problem
 
@@ -93,17 +93,35 @@ What it lacks
 * There are no numbers on how many writes were fenced off and retried.
 * It's built on Spanner. Write fencing needs the storage layer to refuse late writes, which PostgreSQL doesn't do on its own.
 
+### BullFrog (SIGMOD 2021) · [notes](experiment-phase-2-notes/Paper_BullFrog.md)
+
+BullFrog switches to the new schema the moment the DDL runs, without moving any data first. The new table is defined by a plain SQL query over the old one, and rows move only when a query asks for them, with background threads moving the rest. A bitmap in memory makes sure each row moves exactly once, even with many transactions touching it.
+
+What it solves
+* The cutover is instant, with no backfill to wait for.
+* The mapping is ordinary SQL, so it can join a lookup table like E3's `order_status`. Our change is the simplest case they support, one old row to one new row.
+* At moderate load (450 TPS on TPC-C), throughput and latency were close to running with no migration at all, and up to an order of magnitude better than eager or multi-step migration.
+* It's a Postgres extension, with no changes to Postgres itself.
+
+What it lacks
+* It cuts off the old app. For a change that isn't backward compatible, like ours, every old instance is rejected the moment the DDL runs, so everything has to switch at once.
+* Reads turn into writes. Reading a row that hasn't moved yet migrates it first, which is a problem for read-only transactions and replicas.
+* Progress is tracked only in memory, and crash recovery isn't implemented.
+* There are still two copies of the data until the old table is dropped, and the migration only ends when the background threads finish.
+* Near capacity (700 TPS), the migration work tipped the system over and latency went to seconds.
+* It was tested on one 8-core machine with TPC-C, only the new app running, and no replicas.
+
 ## Side by side
 
-| | Phase 1 view (E3) | PRISM | InVerDa | QuantumDB | F1 |
-|---|---|---|---|---|---|
-| Old app reads | Yes | Yes | Yes | Yes | Not addressed (no query rewriting) |
-| Old app writes | Yes (trigger) | No | Yes | Yes | Not addressed |
-| Old and new apps live together | Partly | Old app reads only | Yes | Yes, two at most | Database servers yes, two versions at most; apps not addressed |
-| Text → int value mapping | Yes (lookup table) | One way only | One way only (drop uses a default) | Hand-written (no DML in changesets) | Not in the model (add and drop only) |
-| Keeps the index on selective reads | No | Unclear (depends on the rewrite) | No, for non-materialized versions | Likely, each version reads a real table (not tested in the paper) | Yes, no views involved |
-| Upserts / constraints | No | Unclear | No (constraints out of scope) | Foreign keys kept; upserts not discussed | Foreign key and unique constraints go through a write-only state |
-| Behaviour during migration | Measured, brief lock with queueing risk | Not discussed | "Available", not measured | Non-blocking in 19 tests; lock queues not tested | Measured in production: reads p99 +4.5%, writes p50 +67%; late writes fenced |
-| Storage | 2× after backfill | Old DB copy until deploy | Stored once + auxiliary tables | Ghost copies of the table and everything referencing it | Both columns during the change; leftovers garbage-collected |
-| Prepared statements / drivers | Measured (E4, E7) | Not discussed | Not discussed | JDBC wrapper only; prepared statements not discussed | Not discussed |
-| Tested on | PostgreSQL 16, 2M rows, live writes | MySQL 5.0 / DB2, offline | PostgreSQL 9.4, single thread | PostgreSQL 9.4, simulated load, one company | Google production, ~1,500 servers, 19 changes |
+| | Phase 1 view (E3) | PRISM | InVerDa | QuantumDB | F1 | BullFrog |
+|---|---|---|---|---|---|---|
+| Old app reads | Yes | Yes | Yes | Yes | Not addressed (no query rewriting) | No, rejected after the switch |
+| Old app writes | Yes (trigger) | No | Yes | Yes | Not addressed | No, rejected after the switch |
+| Old and new apps live together | Partly | Old app reads only | Yes | Yes, two at most | Database servers yes, two versions at most; apps not addressed | No (big flip), unless the change is backward compatible |
+| Text → int value mapping | Yes (lookup table) | One way only | One way only (drop uses a default) | Hand-written (no DML in changesets) | Not in the model (add and drop only) | Yes, as SQL (can join a lookup table); one way only |
+| Keeps the index on selective reads | No | Unclear (depends on the rewrite) | No, for non-materialized versions | Likely, each version reads a real table (not tested in the paper) | Yes, no views involved | On the new table yes; finding unmigrated rows may scan the old one |
+| Upserts / constraints | No | Unclear | No (constraints out of scope) | Foreign keys kept; upserts not discussed | Foreign key and unique constraints go through a write-only state | Constraints redeclared on the new table; checking them means migrating more |
+| Behaviour during migration | Measured, brief lock with queueing risk | Not discussed | "Available", not measured | Non-blocking in 19 tests; lock queues not tested | Measured in production: reads p99 +4.5%, writes p50 +67%; late writes fenced | Instant switch; near-invisible at 450 TPS, latency in seconds at 700 TPS |
+| Storage | 2× after backfill | Old DB copy until deploy | Stored once + auxiliary tables | Ghost copies of the table and everything referencing it | Both columns during the change; leftovers garbage-collected | Old and new tables until the old one is dropped |
+| Prepared statements / drivers | Measured (E4, E7) | Not discussed | Not discussed | JDBC wrapper only; prepared statements not discussed | Not discussed | Not discussed |
+| Tested on | PostgreSQL 16, 2M rows, live writes | MySQL 5.0 / DB2, offline | PostgreSQL 9.4, single thread | PostgreSQL 9.4, simulated load, one company | Google production, ~1,500 servers, 19 changes | PostgreSQL 11, one 8-core machine, TPC-C |
