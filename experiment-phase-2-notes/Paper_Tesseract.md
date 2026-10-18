@@ -61,3 +61,100 @@ Hu, Wang (Simon Fraser University), Zhou (Tencent) · [PDF](https://www.vldb.org
 > Question - In E9, one long transaction made everyone queue behind a waiting `ALTER`. Here, a long transaction that started before the change wouldn't block anyone, but it would be aborted if it tried to write after the change committed. Which is better depends on whether the long one or the many short ones matter more.
 
 > Question - Postgres can also run DDL inside a transaction, and roll it back. MySQL can't. So the "DDL is just a transaction" part already exists in Postgres. What's missing there is the versioned schema that lets old snapshots keep reading.
+
+## Section 4 - Data-Definition-as-Modification
+This section tries the most direct version of Section 3's idea, then shows why it doesn't work.
+
+### 4.1 How a normal transaction works (snapshot isolation)
+* Read: walk a row's chain of versions from newest to oldest, and take the first one that was committed before the transaction started.
+* Write: only allowed if the transaction can see the row's latest version. The new version is linked in front of the old one.
+* Conflict: if someone else has written a newer version of that row since this transaction started, the write fails. Only one uncommitted version of a row is allowed at a time, so the first to write wins and the other aborts.
+* Commit: every new version the transaction wrote is stamped with one commit timestamp, and becomes visible to transactions that start after it.
+
+### 4.2 The basic version: a schema change as one normal transaction
+* Step 1: write a new version of the table's schema record, using a normal write. If the transaction can't see the latest schema, it aborts.
+* Step 2: run the migration with normal reads and writes. Every row gets a new version, converted to the new schema, added to the same version chain as the old data.
+* Meanwhile, every ordinary transaction reads the schema version its snapshot can see, and a write also has to use the latest schema. Each transaction remembers which schema versions it used.
+* At commit, every transaction checks that the schemas it used are still the latest. If not, it aborts. If they are, all its new versions, data and schema alike, become visible together.
+* So the new schema and all the converted rows appear at the same moment, when the schema change commits, and a failure leaves nothing behind.
+
+* To extrapolate into what I am doing: one transaction writes "S2: `status` is an integer" into the catalog, then writes a new version of all 2 million orders with `'paid'` stored as 2. Nothing is visible until it commits.
+
+### 4.3 Why that doesn't work
+The paper says following snapshot isolation strictly "is a double-edged sword that can make DDaM impractical", for three reasons:
+
+1. It blocks ordinary writes. The schema change is long, a full scan plus a write for every row. Any ordinary transaction that updates a row the schema change has already rewritten hits a write-write conflict and aborts. Their example: T1 and T2 update the table while T3 runs `ALTER TABLE`, and lose. Transactions that touch other tables are fine.
+2. The schema change itself can abort. If an ordinary transaction updates a row before the schema change reaches it, the schema change hits the conflict when it gets there, aborts, and all the work so far is wasted. Under "first committer wins", whether a schema change ever commits is "pure 'luck'".
+3. It's expensive to track. Every row the migration writes goes into the transaction's write set, so for a big table the write set is huge and committing it is slow.
+
+* In their evaluation, "almost no DDL transaction committed" this way once data had to be migrated.
+
+> Question - This is E9's fight in a different form. In Postgres, the long `ALTER` waits for a lock and everyone queues behind it. Here, the long schema change and the short writes collide, and someone gets aborted. Either way, one long operation and many short ones can't share a table for free.
+
+## Section 5 - Tesseract with Relaxed DDaM
+In short: instead of updating every row where it is, copy every row, converted, into a hidden new table. Let live writes carry on against the old one, replay whatever they changed, then swap the new one in when the schema change commits.
+
+* Out of place: the converted rows go into a new, invisible row array. The existing rows aren't touched, so ordinary transactions don't conflict with the copy.
+* Two phases:
+  1. Scan: copy every row that exists when the change starts.
+  2. Change data capture (CDC): replay whatever ordinary transactions changed while the scan was running.
+* "Relaxed snapshot": the scan copies the latest committed version of each row, not the version as of when the schema change started, and keeps that row's original commit timestamp. That's what lets the copy keep up with live writes.
+* Ordinary transactions can keep committing during the migration. Their final commit is held back briefly until it's clear they don't conflict.
+* The new schema is first visible in a "pending" state. When the schema change commits, the new array replaces the old one in one step.
+* If a value can't be converted, the whole schema change aborts and the new copy is thrown away.
+* A transaction that used the old schema can't commit after the new one (Section 3.3), so it's aborted.
+* It can be combined with lazy migration (like BullFrog) for compatible changes. But lazy migration lets "incompatible schema changes" commit "without verification", leaving bad data to fix by hand.
+* Aborted schema changes are called "very rare" with this design, with no numbers.
+
+* To extrapolate into what I am doing:
+  1. Start the change: S2 says `status` is an integer, but it's still pending.
+  2. Scan: copy every order into the hidden array, with `'paid'` stored as 2, and so on.
+  3. CDC: orders inserted or updated during the scan get replayed into the hidden array.
+  4. Commit: the hidden array becomes `orders`. From then on everyone reads integers.
+
+> Question - The scan-then-replay is gh-ost's idea, and my E3 backfill plus trigger, built into the database's own transaction log. No trigger on every write, and no separate tool. In Postgres, logical decoding could play the CDC part. Has anyone built that?
+
+> Question - The hidden array is a full copy of the table until the swap, so storage is 2× for the duration, like E3 and BullFrog.
+
+> Question - The swap is still one moment. Every query from the old app that starts after it gets integers. Tesseract keeps snapshots consistent, but it doesn't keep the old app working, and it doesn't rewrite queries.
+
+## Section 6 - Evaluation
+
+Results
+
+| Schema change | Blocking | Lazy | Tesseract |
+|---|---|---|---|
+| Add a column, 100M rows | ~5 s near zero, then about half the normal throughput | Smaller dip, but slower for 5–6 s after | Up to ~10% drop, fully recovered after ~12–13 s |
+| Add a constraint, and both together | Near zero during the change | — | Stayed near normal |
+| Bigger tables (10M → 100M rows) | Much worse | Worse | Slightly bigger dip and longer, much less affected than the others |
+| TPC-CD: split, aggregate, join tables | Highest overhead | — | About the same as Lazy, slightly better on some, slightly slower on adding a column |
+| TPC-CD: create index, add constraint | Fewer transactions | — | More transactions than Blocking |
+
+* CDC has to keep up: with 80% writes, 3–4 CDC threads fell behind, and 5 were enough.
+* Not reported: abort rates, how long each migration took, memory or storage overhead.
+
+> Question - None of the tested changes is ours. They added columns and constraints, split, aggregated and joined tables, and created indexes. `MODIFY COLUMN`, the copy-and-check change from Section 3.1, isn't in the list.
+
+> Question - 40 cores, 375 GB of RAM, everything in memory, logs on a RAM disk, and 8 threads just for the migration. The "~10%" is from that machine. On a disk-based Postgres with real write-ahead logging, the copy and the replay both cost a lot more.
+
+> Question - No abort numbers. Sections 3.3 and 5 both depend on aborting transactions that straddle the change. How many were there, and how often would an app have to retry?
+
+## Summary of claims / benefits
+* A schema change can be an ordinary transaction: versioned, snapshot-consistent, and rolled back on failure.
+* Queries that started before the change keep seeing the old schema and the old data, without waiting.
+* No views or triggers, and no separate migration tool.
+* Copy plus replay lets ordinary writes keep going during the migration. Adding a column to 100M rows cost up to ~10% throughput, against near zero for a blocking change.
+* Transactions that would mix old and new schemas are stopped at commit.
+
+## My 2 cents
+
+Tesseract is the most elegant answer to the database's half of the problem. No triggers, no views, no special lock: the schema is just another row with versions, and a migration is just a big transaction that copies in the background and swaps at the end. If Postgres worked like this, E2's 2.7-second read would have returned immediately.
+
+But it's an engine change, on an in-memory research engine, and it still has a single moment where the schema flips for everyone. It also never tested a type change, which is the thing I actually need.
+
+Some things I keep coming back to:
+
+* Each request should see one consistent version. Tesseract pins every transaction to the schema its snapshot sees, and refuses to mix. The same rule makes sense one level up: each request from the app should be tied to one migration stage, and something should refuse writes that cross stages.
+* Change capture beats triggers. Replaying from the log instead of firing a trigger on every write is what keeps Tesseract's cost low. In Postgres, logical decoding is already there and could keep a new column in sync without a trigger tax.
+* An aborted write needs a plan. Tesseract and F1 both abort transactions that straddle a change. That's correct, but the app has to expect it and retry. Whatever coordinates the migration should make that retry automatic, not leave it to every developer.
+* Consistent snapshots aren't the same as a working old app. Tesseract keeps old snapshots right, but the old app breaks the moment the swap commits. The translation between old and new shapes still has to live somewhere.

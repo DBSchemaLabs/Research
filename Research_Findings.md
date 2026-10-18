@@ -1,6 +1,6 @@
 # Research Findings
 
-Last updated after reading BullFrog.
+Last updated after reading Tesseract.
 
 ## The problem
 
@@ -111,17 +111,35 @@ What it lacks
 * Near capacity (700 TPS), the migration work tipped the system over and latency went to seconds.
 * It was tested on one 8-core machine with TPC-C, only the new app running, and no replicas.
 
+### Tesseract (VLDB 2023) · [notes](experiment-phase-2-notes/Paper_Tesseract.md)
+
+Tesseract treats a schema change as an ordinary transaction. The schema is a row in a catalog table, versioned like any other row, so every transaction reads the schema its snapshot can see. A migration copies every row, converted, into a hidden new table, replays whatever live writes changed during the copy, and swaps the new table in when it commits.
+
+What it solves
+* Queries that started before a change keep seeing the old schema and old data, without waiting. E2's 2.7-second read would return immediately.
+* No views, no triggers, no separate tool. Changes made during the copy are replayed from the database's own log.
+* A transaction that would mix old and new schemas is stopped at commit, like F1's fencing on one machine.
+* Adding a column to 100M rows cost up to ~10% throughput, against near zero for a blocking change.
+
+What it lacks
+* It needs a different engine. It's built on ERMIA, an in-memory research database, and its key trick (swapping a row-ID array) has no direct equivalent in Postgres.
+* The schema still flips for everyone at one moment. The old app gets the new schema as soon as the change commits, and there's no query rewriting.
+* Our kind of change wasn't tested. The evaluation added columns and constraints, split, aggregated and joined tables, and created indexes, but never changed a column's type.
+* The hidden copy means 2× storage until the swap.
+* Transactions that straddle a change are aborted, and there are no numbers on how often.
+* The ~10% comes from a 40-core, 375 GB machine with everything in memory and logs on a RAM disk.
+
 ## Side by side
 
-| | Phase 1 view (E3) | PRISM | InVerDa | QuantumDB | F1 | BullFrog |
-|---|---|---|---|---|---|---|
-| Old app reads | Yes | Yes | Yes | Yes | Not addressed (no query rewriting) | No, rejected after the switch |
-| Old app writes | Yes (trigger) | No | Yes | Yes | Not addressed | No, rejected after the switch |
-| Old and new apps live together | Partly | Old app reads only | Yes | Yes, two at most | Database servers yes, two versions at most; apps not addressed | No (big flip), unless the change is backward compatible |
-| Text → int value mapping | Yes (lookup table) | One way only | One way only (drop uses a default) | Hand-written (no DML in changesets) | Not in the model (add and drop only) | Yes, as SQL (can join a lookup table); one way only |
-| Keeps the index on selective reads | No | Unclear (depends on the rewrite) | No, for non-materialized versions | Likely, each version reads a real table (not tested in the paper) | Yes, no views involved | On the new table yes; finding unmigrated rows may scan the old one |
-| Upserts / constraints | No | Unclear | No (constraints out of scope) | Foreign keys kept; upserts not discussed | Foreign key and unique constraints go through a write-only state | Constraints redeclared on the new table; checking them means migrating more |
-| Behaviour during migration | Measured, brief lock with queueing risk | Not discussed | "Available", not measured | Non-blocking in 19 tests; lock queues not tested | Measured in production: reads p99 +4.5%, writes p50 +67%; late writes fenced | Instant switch; near-invisible at 450 TPS, latency in seconds at 700 TPS |
-| Storage | 2× after backfill | Old DB copy until deploy | Stored once + auxiliary tables | Ghost copies of the table and everything referencing it | Both columns during the change; leftovers garbage-collected | Old and new tables until the old one is dropped |
-| Prepared statements / drivers | Measured (E4, E7) | Not discussed | Not discussed | JDBC wrapper only; prepared statements not discussed | Not discussed | Not discussed |
-| Tested on | PostgreSQL 16, 2M rows, live writes | MySQL 5.0 / DB2, offline | PostgreSQL 9.4, single thread | PostgreSQL 9.4, simulated load, one company | Google production, ~1,500 servers, 19 changes | PostgreSQL 11, one 8-core machine, TPC-C |
+| | Phase 1 view (E3) | PRISM | InVerDa | QuantumDB | F1 | BullFrog | Tesseract |
+|---|---|---|---|---|---|---|---|
+| Old app reads | Yes | Yes | Yes | Yes | Not addressed (no query rewriting) | No, rejected after the switch | Until the swap; after it, sees the new schema |
+| Old app writes | Yes (trigger) | No | Yes | Yes | Not addressed | No, rejected after the switch | Aborted if it straddles the change |
+| Old and new apps live together | Partly | Old app reads only | Yes | Yes, two at most | Database servers yes, two versions at most; apps not addressed | No (big flip), unless the change is backward compatible | No, one schema at a time; old snapshots stay consistent |
+| Text → int value mapping | Yes (lookup table) | One way only | One way only (drop uses a default) | Hand-written (no DML in changesets) | Not in the model (add and drop only) | Yes, as SQL (can join a lookup table); one way only | In the model (`MODIFY COLUMN`), not evaluated |
+| Keeps the index on selective reads | No | Unclear (depends on the rewrite) | No, for non-materialized versions | Likely, each version reads a real table (not tested in the paper) | Yes, no views involved | On the new table yes; finding unmigrated rows may scan the old one | Yes, no views involved |
+| Upserts / constraints | No | Unclear | No (constraints out of scope) | Foreign keys kept; upserts not discussed | Foreign key and unique constraints go through a write-only state | Constraints redeclared on the new table; checking them means migrating more | Yes, still a real table; constraints checked as part of the change |
+| Behaviour during migration | Measured, brief lock with queueing risk | Not discussed | "Available", not measured | Non-blocking in 19 tests; lock queues not tested | Measured in production: reads p99 +4.5%, writes p50 +67%; late writes fenced | Instant switch; near-invisible at 450 TPS, latency in seconds at 700 TPS | Up to ~10% throughput drop on 100M rows; readers never wait |
+| Storage | 2× after backfill | Old DB copy until deploy | Stored once + auxiliary tables | Ghost copies of the table and everything referencing it | Both columns during the change; leftovers garbage-collected | Old and new tables until the old one is dropped | Full hidden copy until the swap |
+| Prepared statements / drivers | Measured (E4, E7) | Not discussed | Not discussed | JDBC wrapper only; prepared statements not discussed | Not discussed | Not discussed | Not discussed |
+| Tested on | PostgreSQL 16, 2M rows, live writes | MySQL 5.0 / DB2, offline | PostgreSQL 9.4, single thread | PostgreSQL 9.4, simulated load, one company | Google production, ~1,500 servers, 19 changes | PostgreSQL 11, one 8-core machine, TPC-C | ERMIA (in-memory), 40 cores, YCSB and TPC-C variant |
