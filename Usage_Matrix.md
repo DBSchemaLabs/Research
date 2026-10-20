@@ -1,8 +1,8 @@
 # Usage Matrix
 
-Which approach to reach for, depending on what you can and can't live with. Based on my Phase 1 experiments (E1–E9) and the six papers read so far: PRISM, InVerDa, QuantumDB, F1, BullFrog and Tesseract. The running example is still `orders.status` going from text to a small integer.
+Which approach to reach for, depending on what you can and can't live with. Based on my Phase 1 experiments (E1–E9) and the seven papers read so far: PRISM, InVerDa, QuantumDB, F1, BullFrog, Tesseract and KVolve. The running example is still `orders.status` going from text to a small integer.
 
-Last updated after reading Tesseract.
+Last updated after reading KVolve.
 
 ## The approaches
 
@@ -15,7 +15,7 @@ Last updated after reading Tesseract.
 | Co-existing versions | Several schema versions live at once, all writable, through generated views and triggers | InVerDa | No public code |
 | Ghost tables | Copy the changed tables, sync both ways with triggers, pick a version per connection | QuantumDB | Yes, Java and PostgreSQL, research prototype |
 | Staged states with leases | Every change walks through delete-only and write-only states, with leases so servers are never more than one version apart | F1 | Not in PostgreSQL. The ideas live on in Spanner and CockroachDB |
-| Lazy migration | Switch instantly, move rows only when they're asked for | BullFrog | PostgreSQL 11 extension, research prototype |
+| Lazy migration | Switch instantly, move rows only when they're asked for | BullFrog, KVolve (for Redis) | BullFrog: PostgreSQL 11 extension, research prototype. KVolve: Redis library, research prototype |
 | Schema change as a transaction | Versioned schema; copy into a hidden table, replay live changes, swap at commit | Tesseract | Not in PostgreSQL. Research engine (ERMIA) |
 
 ## The matrix
