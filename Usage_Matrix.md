@@ -1,8 +1,8 @@
 # Usage Matrix
 
-Which approach to reach for, depending on what you can and can't live with. Based on my Phase 1 experiments (E1–E9) and the seven papers read so far: PRISM, InVerDa, QuantumDB, F1, BullFrog, Tesseract and KVolve. The running example is still `orders.status` going from text to a small integer.
+Which approach to reach for, depending on what you can and can't live with. Based on my Phase 1 experiments (E1–E9) and the eight papers read: PRISM, InVerDa, QuantumDB, F1, BullFrog, Tesseract, KVolve, and Lawrence & Adachi's study of a real project. The running example is still `orders.status` going from text to a small integer.
 
-Last updated after reading KVolve.
+Last updated after reading Lawrence & Adachi, the last of the eight papers.
 
 ## The approaches
 
@@ -41,3 +41,8 @@ Yes means it fits. Partly means it works with a catch. No means it breaks or doe
 | You need an easy rollback | No | No | Partly | Yes, inverse scripts | Yes | Yes, originals untouched | Yes, step back a state | No | Before commit yes, after it no |
 | The database is distributed across many servers | No | No | No | No | No | No | Yes | No | No, single machine |
 
+## What real projects look like
+
+Lawrence & Adachi's six years of migrations from one Django app are a useful reality check before picking anything heavy. Over 70% of changes added something (an index, a column, a foreign key, a table), and changing a column's type wasn't among the common ones. Blocking operations happened most months, but only about 5.5% of months had enough of them to plausibly cause downtime. The real damage came from full-table rewrites and long runs of small blocking steps.
+
+So for most changes, an in-place `ALTER` with `lock_timeout`, or the add-empty-then-fill-in-chunks recipe, is enough. The heavier approaches only start to pay off for value re-encodings, rolling deploys, and tables too big or too busy to rewrite.

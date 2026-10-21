@@ -1,6 +1,6 @@
 # Research Findings
 
-Last updated after reading KVolve.
+Last updated after reading Lawrence & Adachi, the last of the eight papers.
 
 ## The problem
 
@@ -147,7 +147,26 @@ What it lacks
 * Atomicity relies on Redis being single-threaded, which doesn't carry over to a relational database.
 * Version tags cost about 15% more memory, all the time.
 
+### Lawrence & Adachi (VEM 2021) · [notes](case_studies/LawrenceAdachi_Blocking_Operations.md)
+
+Not a system, but a study of how often schema changes block in a real project. They went through six years of one company's Django migrations on PostgreSQL 9.6, 1,499 changes in all, and sorted each by whether it takes a blocking lock.
+
+What it shows
+* Blocking changes are routine. 87.5% of months had at least one.
+* But only about 5.5% of months had enough of them to plausibly cause downtime anyone would notice.
+* The real damage comes from operations that scan a whole table (an `ADD COLUMN` with a default took up to 11 s on 1M rows on PG 9.6), and from long runs of small ones.
+* Over 70% of changes added something. Changing a column's type wasn't among the common ones.
+* The team's fixes are the manual recipe: add the column empty, fill it in chunks, use concurrent operations.
+
+What it lacks
+* It counts operations, not waiting. Lock queues behind long transactions (E9) can't show up.
+* There's no confirmed downtime, because there were no logs to check against.
+* PostgreSQL 9.6. Some of what blocked then is instant on PG 11 and later.
+* One company, one Django app.
+
 ## Side by side
+
+Lawrence & Adachi isn't in this table, because it's a study of real projects rather than an approach.
 
 | | Phase 1 view (E3) | PRISM | InVerDa | QuantumDB | F1 | BullFrog | Tesseract | KVolve |
 |---|---|---|---|---|---|---|---|---|
